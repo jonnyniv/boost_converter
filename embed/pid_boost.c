@@ -48,11 +48,29 @@
 #define PWM_DUTY_MAX 235 
 //Create a variable to ensure constant timings between measurements
 volatile int cont = 0;
+volatile uint8_t v = 0;
+volatile uint8_t sp = 0;
 
 ISR(TIMER0_COMPA_vect)
 {
     cont = 1;
 }
+
+ISR(USART0_RX_vect)
+{
+    uint8_t recieved;
+	recieved = UDR0;
+	if(recieved == 0xFF)
+	{
+		UDR0 = v;
+	}
+	else if(recieved < 150)
+	{
+		sp = recieved;
+		UDR0 = v;
+	}
+}
+
 //Create structure to store PID values
 typedef struct
 {
@@ -86,10 +104,9 @@ int main(void)
 	double prm;
     double newP;
     double setPoint;
-    double currVoltage;
+	double currVoltage;
     double currADC;
     double dutyCycle;
-    uint16_t count;
 	
 	init_stdio2uart0();
 	init_pwm(); 
@@ -105,8 +122,10 @@ int main(void)
     setPoint = 5.0f;
 	prm = 50.0f;
     dutyCycle = prm/256;
-    
-    //printf("\r\nIlMatto Coms Boost READY!\r\n");
+    sp = (uint8_t)(setPoint*10);
+	
+	
+    printf("\r\nIlMatto Coms Boost READY!\r\n");
     initTimer();
 	sei();
 	for(;;)
@@ -134,6 +153,8 @@ int main(void)
         pwm_duty((uint8_t)prm);
         pid->erprev = pid->error;
         
+		v = (uint8_t)(currVoltage * 10);
+		if(sp != (uint8_t)(setPoint*10)) setPoint = (double) (sp/10);
         while(!cont);
 	}
     free(pid);
@@ -170,9 +191,10 @@ int ugetchar0(FILE *stream)
 void init_stdio2uart0(void)
 {
 	/* Configure UART0 baud rate, one start bit, 8-bit, no parity and one stop bit */
+	//Enable Rx complete interrupt
 	UBRR0H = (F_CPU/(BDRATE_BAUD*16L)-1) >> 8;
 	UBRR0L = (F_CPU/(BDRATE_BAUD*16L)-1);
-	UCSR0B = _BV(RXEN0) | _BV(TXEN0);
+	UCSR0B = _BV(RXEN0) | _BV(TXEN0) | _BV(RXCIE0);
 	UCSR0C = _BV(UCSZ00) | _BV(UCSZ01);
 
 	/* Setup new streams for input and output */
