@@ -26,35 +26,44 @@
 #include <avr/io.h>
 #include <util/delay.h>
 #include <math.h>
-
+#include <avr/interrupt.h>
 
 #define BDRATE_BAUD  9600
 #define BUFFSIZE 200
 
-#define TUNING_DELAY 10
-
 #define ADCREF_V     3.3
 #define ADCMAXREAD   1023   /* 10 bit ADC */
 //Set PID controller constants
-#define K_P 0.1
-#define K_I 0   //Place holder
-#define K_D 0   //Place holder
-#define GAMMA 0.176
+#define K_P 0.008	//Proportionality constant
+#define K_I 0	//Integral constant
+#define K_D K_P/1000	//Derivative constant
+
+
+#define GAMMA 0.1760299
 
 
 /* Find out what value gives the maximum
    output voltage for your circuit:
 */
-#define PWM_DUTY_MAX 250    
+#define PWM_DUTY_MAX 235 
+//Create a variable to ensure constant timings between measurements
+volatile int cont = 0;
 
-typedef struct pc
+ISR(TIMER0_COMPA_vect)
 {
-    //double d;
+    cont = 1;
+}
+//Create structure to store PID values
+typedef struct
+{
+    double d;
     double i;
     double p;
     double error;
-    double errsum;
-    double dt;
+	double erprev;
+    //double errsum;
+    
+	double dt;
 } pid_data;
 
 void init_stdio2uart0(void);
@@ -64,7 +73,9 @@ void init_adc(void);
 double v_load(void);
 double calcPid(pid_data *pid);
 void init_pwm(void);
+void initTimer();
 void pwm_duty(uint8_t x);
+
 
 int main(void)
 {
@@ -74,37 +85,44 @@ int main(void)
 	
 	double prm;
     double newP;
-    //Create adc cache variable
     double setPoint;
     double currVoltage;
     double currADC;
     double dutyCycle;
-    
+    uint16_t count;
+	
 	init_stdio2uart0();
 	init_pwm(); 
 	init_adc();
+	
 	pid_data *pid = (pid_data *) malloc(sizeof(pid));
     
-    pid->dt = TUNING_DELAY * 1e-3;
-    
+    pid->dt =  0.0025;
+    pid->i = 0;
+	pid->error = 0;
+	pid->d = 0;
     //Set default setpoint to the adc value of 1.5 V
     setPoint = 5.0f;
 	prm = 50.0f;
     dutyCycle = prm/256;
     
-    printf("\r\nIlMatto Coms Boost READY!\r\n");
-    
+    //printf("\r\nIlMatto Coms Boost READY!\r\n");
+    initTimer();
+	sei();
 	for(;;)
     {  
+		cont = 0;
         //Retrieve current value for adc        
         //and calculate error relative to setPoint
         currADC = v_load();
         currVoltage = currADC / GAMMA;
-        pid->error = currVoltage - setPoint;
+        pid->error = setPoint - currVoltage;
         
         //Cache new value of PWM to a variable
         
-        dutyCycle -= calcPid(pid);
+        dutyCycle = dutyCycle + calcPid(pid);
+		if(dutyCycle < 0) dutyCycle = 0;
+		else if(dutyCycle > 0.90) dutyCycle = 0.90;
         newP = dutyCycle * 256;
         
         //Set prm depending on whether newP is out of bounds
@@ -114,12 +132,25 @@ int main(void)
         
         //Update PWM
         pwm_duty((uint8_t)prm);
+        pid->erprev = pid->error;
         
-        
-        _delay_ms(TUNING_DELAY);
+        while(!cont);
 	}
     free(pid);
     return 0;
+}
+
+//This timer is used to ensure polling remains constant
+void initTimer()
+{
+    TCCR0A |= _BV(WGM01);    //CTC Mode 2
+            
+    TCCR0B |= _BV(CS02);      //Prescalar 1024
+            
+    OCR0A = 117;
+    
+    TIMSK0 |= _BV(OCIE0A);  //Enable interrupt
+    TIFR0 |= _BV(OCF0A);
 }
 
 int uputchar0(char c, FILE *stream)
@@ -156,12 +187,16 @@ void init_stdio2uart0(void)
 
 double calcPid(pid_data *pid)
 {
-    //Calcullate proportional error
+    //Calculate proportional gain
     pid->p = K_P * pid->error;
-    //Calculate integral error
-    pid->i = K_I * pid->errsum * pid->dt;
-    pid->errsum += pid->error;
-    return pid->p + pid->i;
+	
+    //Calculate integral gain
+    //pid->i = K_I * pid->errsum * pid->dt;
+    //pid->errsum += pid->error;
+	
+	//Calculate derivative gain
+	pid->d = K_D * (pid->error - pid->erprev) / pid->dt;
+    return pid->p + pid->d;
 }
 
 void init_adc (void)

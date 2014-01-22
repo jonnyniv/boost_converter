@@ -93,7 +93,7 @@ int main(void)
     dutyCycle = prm/256;
     
     printf("\r\nIlMatto Coms Boost READY!\r\n");
-    
+	sei();
 	for(;;)
     {  
         //Retrieve current value for adc        
