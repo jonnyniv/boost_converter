@@ -34,53 +34,70 @@
 #define ADCREF_V     3.3
 #define ADCMAXREAD   1023   /* 10 bit ADC */
 //Set PID controller constants
-#define K_P 0.008	//Proportionality constant
-#define K_I 0	//Integral constant
-#define K_D K_P/1000	//Derivative constant
+#define K_P 0.010	//Proportionality constant
+#define K_I K_P/1000	//Integral constant
+#define K_D K_P/100	//Derivative constant
 
-
+//Calibration offset due to floating point rounding errors
+#define CALIB_ERROR 0.60
+//Gamma to convert from ADC_V to actual V
 #define GAMMA 0.1760299
 
 
 /* Find out what value gives the maximum
    output voltage for your circuit:
 */
-#define PWM_DUTY_MAX 235 
+#define PWM_DUTY_MAX 235 //  90ish %
+
 //Create a variable to ensure constant timings between measurements
 volatile int cont = 0;
+//Set up UART integers:
+//v is the current value for voltage multiplied by 10, e.g. 1.5 V = 15
 volatile uint8_t v = 0;
+//sp is the received set point multiplied by 10.
 volatile uint8_t sp = 0;
-
+//Interrupt to synchronise loop with polling frequency
 ISR(TIMER0_COMPA_vect)
 {
     cont = 1;
 }
 
+//UART0 interrupt reads one byte and uses that as setpoint
 ISR(USART0_RX_vect)
 {
-    uint8_t recieved;
-	recieved = UDR0;
-	if(recieved == 0xFF)
+	//Cache UART0 Data register to an integer
+    uint8_t received;
+	received = UDR0;
+	
+	//Special case: 0xFE is used as a read-only request
+	if(received == 255)
 	{
+		while (!(UCSR0A & _BV(UDRE0)));
 		UDR0 = v;
 	}
-	else if(recieved < 150)
+	
+	else if(received <= 150)
 	{
-		sp = recieved;
-		UDR0 = v;
+		sp = received;
 	}
 }
 
 //Create structure to store PID values
 typedef struct
 {
+	//d is the differential gain
     double d;
-    double i;
+    //i is the integral gain
+	double i;
+	//p is the proportional gain
     double p;
+	//error stores the current error between set point and actual V 
     double error;
+	//erprev stores the error from the previous read 
 	double erprev;
-    //double errsum;
-    
+	//errsum stores the accumulation off all errors 
+    double errsum;
+    //dt stores the loop time
 	double dt;
 } pid_data;
 
@@ -97,54 +114,60 @@ void pwm_duty(uint8_t x);
 
 int main(void)
 {
-	//uint16_t cnt =0;
-    //char cmd[BUFFSIZE];
-    //int res;
-	
+	//prm parses the new pwm value to the pwm_duty function
 	double prm;
+	//newP acts as an intermediate value
     double newP;
+	//setPoint stores the current voltage setpoint
     double setPoint;
+	//currVoltage stores the current voltage
 	double currVoltage;
+	//currADC is the voltage at the voltage divider
     double currADC;
+	//dutyCycle stores the duty cycle as a value between 0 and 1
     double dutyCycle;
 	
 	init_stdio2uart0();
 	init_pwm(); 
 	init_adc();
 	
+	//Create pid_data structure
 	pid_data *pid = (pid_data *) malloc(sizeof(pid));
     
+	//Set initial values
     pid->dt =  0.0025;
     pid->i = 0;
 	pid->error = 0;
 	pid->d = 0;
-    //Set default setpoint to the adc value of 1.5 V
+	
+    //Set default setpoint and prm value
     setPoint = 5.0f;
 	prm = 50.0f;
+	//Ensure the duty cycle reflects prm
     dutyCycle = prm/256;
+	//Create the sp variable for comparison purposes
     sp = (uint8_t)(setPoint*10);
 	
-	
-    printf("\r\nIlMatto Coms Boost READY!\r\n");
     initTimer();
+	//Enable interrupts
 	sei();
 	for(;;)
-    {  
+    {
+		//Set the value for the repeat enable value to 0 at the beginning
 		cont = 0;
         //Retrieve current value for adc        
         //and calculate error relative to setPoint
         currADC = v_load();
-        currVoltage = currADC / GAMMA;
+        currVoltage = (currADC / GAMMA)+CALIB_ERROR;
         pid->error = setPoint - currVoltage;
         
         //Cache new value of PWM to a variable
-        
         dutyCycle = dutyCycle + calcPid(pid);
+		//Check if this value is within bounds
 		if(dutyCycle < 0) dutyCycle = 0;
 		else if(dutyCycle > 0.90) dutyCycle = 0.90;
         newP = dutyCycle * 256;
-        
-        //Set prm depending on whether newP is out of bounds
+        //Retest with value converted
         if(newP < 0) prm = 0;
         else if(newP > PWM_DUTY_MAX) prm = PWM_DUTY_MAX;
         else prm = newP;
@@ -153,15 +176,18 @@ int main(void)
         pwm_duty((uint8_t)prm);
         pid->erprev = pid->error;
         
+		//Cache current voltage for UART and check whether the setpoint has changed
 		v = (uint8_t)(currVoltage * 10);
-		if(sp != (uint8_t)(setPoint*10)) setPoint = (double) (sp/10);
-        while(!cont);
+		if(sp != (uint8_t)(setPoint*10)) setPoint = ((double) sp)/10;
+		
+		while(!cont);
 	}
+	//free the memory should the loop ever terminate
     free(pid);
     return 0;
 }
 
-//This timer is used to ensure polling remains constant
+//This timer is used to ensure polling frequency remains constant
 void initTimer()
 {
     TCCR0A |= _BV(WGM01);    //CTC Mode 2
@@ -207,18 +233,19 @@ void init_stdio2uart0(void)
 	stdin = &uin;
 }
 
+
 double calcPid(pid_data *pid)
 {
     //Calculate proportional gain
     pid->p = K_P * pid->error;
 	
     //Calculate integral gain
-    //pid->i = K_I * pid->errsum * pid->dt;
-    //pid->errsum += pid->error;
+    pid->i = K_I * pid->errsum * pid->dt;
+    pid->errsum += pid->error;
 	
 	//Calculate derivative gain
 	pid->d = K_D * (pid->error - pid->erprev) / pid->dt;
-    return pid->p + pid->d;
+    return pid->p + pid->d + pid->i;
 }
 
 void init_adc (void)
@@ -246,7 +273,7 @@ double v_load(void)
      while ( ADCSRA & _BV ( ADSC ) );
      adcread = ADC;
     
-     printf("ADC=%4d", adcread);  
+     //printf("ADC=%4d", adcread);  
  
      return (double) (adcread * ADCREF_V/ADCMAXREAD);
 }
@@ -276,7 +303,7 @@ void pwm_duty(uint8_t x)
 {
     x = x > PWM_DUTY_MAX ? PWM_DUTY_MAX : x;
     
-    printf("PWM=%3u  ==>  ", x);  
+    //printf("PWM=%3u  ==>  ", x);  
 
     OCR2A = x;
 }
